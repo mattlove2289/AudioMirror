@@ -1,7 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from audio import get_default_speaker, get_speaker_names
+from audio import AudioMirrorEngine
 
 
 class AudioMirrorApp:
@@ -11,7 +11,7 @@ class AudioMirrorApp:
         self.root.geometry("420x260")
         self.root.resizable(False, False)
 
-        self.is_running = False
+        self.engine = AudioMirrorEngine()
 
         self.default_device_var = tk.StringVar(value="Detecting...")
         self.output_device_var = tk.StringVar()
@@ -28,12 +28,7 @@ class AudioMirrorApp:
         title.pack(anchor="w", pady=(0, 15))
 
         ttk.Label(main, text="Default Output").pack(anchor="w")
-        self.default_label = ttk.Label(
-            main,
-            textvariable=self.default_device_var,
-            font=("Segoe UI", 10)
-        )
-        self.default_label.pack(anchor="w", pady=(2, 12))
+        ttk.Label(main, textvariable=self.default_device_var).pack(anchor="w", pady=(2, 12))
 
         ttk.Label(main, text="Mirror To").pack(anchor="w")
         self.output_combo = ttk.Combobox(
@@ -66,7 +61,6 @@ class AudioMirrorApp:
 
         status_frame = ttk.Frame(main)
         status_frame.pack(fill="x")
-
         ttk.Label(status_frame, text="Status: ").pack(side="left")
         ttk.Label(status_frame, textvariable=self.status_var).pack(side="left")
 
@@ -78,43 +72,51 @@ class AudioMirrorApp:
         refresh_button.pack(anchor="e", pady=(10, 0))
 
     def refresh_devices(self):
-        default_speaker = get_default_speaker()
-        speaker_names = get_speaker_names()
+        default_speaker = self.engine.get_default_speaker()
+        speaker_names = self.engine.get_speaker_names()
 
         if default_speaker:
-            self.default_device_var.set(default_speaker.name)
+            self.default_device_var.set(default_speaker["name"])
         else:
             self.default_device_var.set("No default device found")
 
         self.output_combo["values"] = speaker_names
 
-        if speaker_names:
-            if not self.output_device_var.get():
-                self.output_device_var.set(speaker_names[0])
+        if speaker_names and not self.output_device_var.get():
+            self.output_device_var.set(speaker_names[0])
 
         self.status_var.set("Ready")
 
     def start_mirroring(self):
         selected_output = self.output_device_var.get()
+        default_output = self.default_device_var.get()
 
         if not selected_output:
             messagebox.showwarning("No Output Selected", "Please select an output device.")
             return
 
-        if selected_output == self.default_device_var.get():
+        if selected_output == default_output:
             messagebox.showwarning(
                 "Same Device Selected",
                 "Please choose a different output device to mirror to."
             )
             return
 
-        self.is_running = True
-        self.status_var.set("Mirroring")
-        self.start_button.config(state="disabled")
-        self.stop_button.config(state="normal")
+        try:
+            self.engine.start(selected_output)
+            self.status_var.set("Mirroring")
+            self.start_button.config(state="disabled")
+            self.stop_button.config(state="normal")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to start mirroring:\n{e}")
+            self.status_var.set("Error")
 
     def stop_mirroring(self):
-        self.is_running = False
-        self.status_var.set("Stopped")
-        self.start_button.config(state="normal")
-        self.stop_button.config(state="disabled")
+        try:
+            self.engine.stop()
+            self.status_var.set("Stopped")
+            self.start_button.config(state="normal")
+            self.stop_button.config(state="disabled")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to stop mirroring:\n{e}")
+            self.status_var.set("Error")

@@ -1,2 +1,2 @@
-soundcard
+pyaudiowpatch
 numpy
