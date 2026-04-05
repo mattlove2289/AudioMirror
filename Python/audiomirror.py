@@ -1,12 +1,12 @@
+import queue
 import threading
 import numpy as np
 import customtkinter as ctk
 from tkinter import messagebox
 import pyaudiowpatch as pyaudio
-from PIL import Image, ImageDraw
-import io
+import darkdetect
 
-ctk.set_appearance_mode("dark")
+ctk.set_appearance_mode("system")
 ctk.set_default_color_theme("blue")
 
 
@@ -14,10 +14,13 @@ ctk.set_default_color_theme("blue")
 
 class AudioMirrorEngine:
     def __init__(self):
-        self.thread = None
-        self.stop_event = threading.Event()
         self.is_running = False
+        self.is_muted = False
         self._pa = pyaudio.PyAudio()
+        self._stop_event = threading.Event()
+        self._read_thread = None
+        self._write_thread = None
+        self._queue = queue.Queue(maxsize=4)  # Small queue = low latency, no buildup
 
     def get_loopback_devices(self):
         devices = []
@@ -63,15 +66,14 @@ class AudioMirrorEngine:
                 return d
         return None
 
-    def _find_working_channel_count(self, device_index, sample_rate, is_input=True):
-        fmt = pyaudio.paFloat32
+    def _find_working_channels(self, device_index, sample_rate, is_input=True):
         info = self._pa.get_device_info_by_index(device_index)
         max_ch = int(info["maxInputChannels"] if is_input else info["maxOutputChannels"])
         for ch in [max_ch, 8, 4, 2, 1]:
             if ch > max_ch or ch < 1:
                 continue
             try:
-                kwargs = dict(format=fmt, channels=ch, rate=int(sample_rate), frames_per_buffer=1024)
+                kwargs = dict(format=pyaudio.paFloat32, channels=ch, rate=int(sample_rate), frames_per_buffer=512)
                 if is_input:
                     kwargs["input"] = True
                     kwargs["input_device_index"] = device_index
@@ -86,44 +88,67 @@ class AudioMirrorEngine:
                 continue
         return None
 
+    def set_muted(self, muted):
+        self.is_muted = muted
+
     def start(self, source_name, target_name):
         if self.is_running:
             return
-        self.stop_event.clear()
-        self.thread = threading.Thread(target=self._mirror_loop, args=(source_name, target_name), daemon=True)
-        self.thread.start()
+
+        source = self.find_loopback_by_name(source_name)
+        target = self.find_output_by_name(target_name)
+
+        if source is None or target is None:
+            raise RuntimeError("Device not found.")
+
+        sample_rate = int(source["defaultSampleRate"])
+        src_ch = self._find_working_channels(source["index"], sample_rate, is_input=True)
+        dst_ch = self._find_working_channels(target["index"], sample_rate, is_input=False)
+
+        if src_ch is None or dst_ch is None:
+            raise RuntimeError("Could not open audio device.")
+
+        self._stop_event.clear()
+        # Clear any stale data in the queue
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except Exception:
+                break
+
+        self._read_thread = threading.Thread(
+            target=self._reader,
+            args=(source["index"], sample_rate, src_ch, dst_ch),
+            daemon=True
+        )
+        self._write_thread = threading.Thread(
+            target=self._writer,
+            args=(target["index"], sample_rate, dst_ch),
+            daemon=True
+        )
+
+        self._read_thread.start()
+        self._write_thread.start()
         self.is_running = True
 
     def stop(self):
         if not self.is_running:
             return
-        self.stop_event.set()
-        if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=3)
+        self._stop_event.set()
+        # Unblock the writer if it's waiting on the queue
+        try:
+            self._queue.put_nowait(None)
+        except Exception:
+            pass
+        if self._read_thread:
+            self._read_thread.join(timeout=3)
+        if self._write_thread:
+            self._write_thread.join(timeout=3)
         self.is_running = False
 
-    def _mirror_loop(self, source_name, target_name):
-        source = self.find_loopback_by_name(source_name)
-        target = self.find_output_by_name(target_name)
-
-        if source is None or target is None:
-            print("Error: Device not found.")
-            self.is_running = False
-            return
-
-        sample_rate = int(source["defaultSampleRate"])
-        src_ch = self._find_working_channel_count(source["index"], sample_rate, is_input=True)
-        dst_ch = self._find_working_channel_count(target["index"], sample_rate, is_input=False)
-
-        if src_ch is None or dst_ch is None:
-            print("Error: Could not open device.")
-            self.is_running = False
-            return
-
-        frames = 256
-        fmt = pyaudio.paFloat32
-        record_stream = None
-        play_stream = None
+    def _reader(self, device_index, sample_rate, src_ch, dst_ch):
+        """Reads from loopback, converts channels, pushes to queue."""
+        frames = 512
 
         try:
             import ctypes
@@ -134,17 +159,19 @@ class AudioMirrorEngine:
             pass
 
         try:
-            record_stream = self._pa.open(
-                format=fmt, channels=src_ch, rate=sample_rate,
-                input=True, input_device_index=source["index"], frames_per_buffer=frames,
-            )
-            play_stream = self._pa.open(
-                format=fmt, channels=dst_ch, rate=sample_rate,
-                output=True, output_device_index=target["index"], frames_per_buffer=frames,
+            stream = self._pa.open(
+                format=pyaudio.paFloat32,
+                channels=src_ch,
+                rate=sample_rate,
+                input=True,
+                input_device_index=device_index,
+                frames_per_buffer=frames,
             )
 
-            while not self.stop_event.is_set():
-                raw = record_stream.read(frames, exception_on_overflow=False)
+            while not self._stop_event.is_set():
+                raw = stream.read(frames, exception_on_overflow=False)
+
+                # Channel conversion
                 if src_ch != dst_ch:
                     audio = np.frombuffer(raw, dtype=np.float32).reshape(-1, src_ch)
                     if dst_ch == 1:
@@ -155,38 +182,81 @@ class AudioMirrorEngine:
                     else:
                         audio = np.repeat(audio[:, :1], dst_ch, axis=1)
                     raw = audio.astype(np.float32).tobytes()
-                play_stream.write(raw)
 
-        except Exception as e:
-            print(f"Audio mirroring error: {e}")
-        finally:
-            for s in [record_stream, play_stream]:
-                if s:
+                # Drop oldest chunk if queue is full to prevent latency buildup
+                if self._queue.full():
                     try:
-                        s.stop_stream()
-                        s.close()
+                        self._queue.get_nowait()
                     except Exception:
                         pass
 
-        self.is_running = False
+                try:
+                    self._queue.put_nowait(raw)
+                except Exception:
+                    pass
 
-    def __del__(self):
+        except Exception as e:
+            print(f"Reader error: {e}")
+        finally:
+            try:
+                stream.stop_stream()
+                stream.close()
+            except Exception:
+                pass
+
+    def _writer(self, device_index, sample_rate, dst_ch):
+        """Pulls from queue, writes to output device."""
+        frames = 512
+        silence = b'\x00' * frames * dst_ch * 4
+
         try:
-            self._pa.terminate()
+            import ctypes
+            ctypes.windll.kernel32.SetThreadPriority(
+                ctypes.windll.kernel32.GetCurrentThread(), 2
+            )
         except Exception:
             pass
 
+        try:
+            stream = self._pa.open(
+                format=pyaudio.paFloat32,
+                channels=dst_ch,
+                rate=sample_rate,
+                output=True,
+                output_device_index=device_index,
+                frames_per_buffer=frames,
+            )
 
-# ── Refresh icon ──────────────────────────────────────────────────────────────
+            while not self._stop_event.is_set():
+                try:
+                    raw = self._queue.get(timeout=0.1)
+                except queue.Empty:
+                    stream.write(silence)
+                    continue
 
-def make_refresh_icon(size=20, color="#9ca3af"):
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    cx, cy, r = size // 2, size // 2, size // 2 - 2
-    draw.arc([cx - r, cy - r, cx + r, cy + r], start=30, end=300, fill=color, width=2)
-    # Arrow head
-    draw.polygon([(cx + r - 1, cy - 5), (cx + r + 4, cy - 1), (cx + r - 1, cy + 3)], fill=color)
-    return ctk.CTkImage(light_image=img, dark_image=img, size=(size, size))
+                if raw is None:
+                    break
+
+                if self.is_muted:
+                    stream.write(silence)
+                else:
+                    stream.write(raw)
+
+        except Exception as e:
+            print(f"Writer error: {e}")
+        finally:
+            try:
+                stream.stop_stream()
+                stream.close()
+            except Exception:
+                pass
+
+    def __del__(self):
+        try:
+            self.stop()
+            self._pa.terminate()
+        except Exception:
+            pass
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -196,180 +266,154 @@ class AudioMirrorApp(ctk.CTk):
         super().__init__()
 
         self.title("AudioMirror")
-        self.geometry("500x460")
+        self.geometry("480x400")
         self.resizable(False, False)
-        self.configure(fg_color="#111827")
 
         self.engine = AudioMirrorEngine()
         self.source_var = ctk.StringVar()
         self.target_var = ctk.StringVar()
+        self._muted = False
+        self._mirroring = False
 
         self._build_ui()
         self.refresh_devices()
 
-    def _build_ui(self):
-        # Outer padding frame
-        outer = ctk.CTkFrame(self, fg_color="#111827")
-        outer.pack(fill="both", expand=True, padx=20, pady=20)
+    def _dark(self):
+        return darkdetect.isDark()
 
-        # Card
-        card = ctk.CTkFrame(outer, corner_radius=16, fg_color="#1e2433", border_width=1, border_color="#2d3448")
+    def _build_ui(self):
+        dark = self._dark()
+
+        bg          = "#1c1c1e" if dark else "#f2f2f7"
+        card_bg     = "#2c2c2e" if dark else "#ffffff"
+        border      = "#3a3a3c" if dark else "#d1d1d6"
+        input_bg    = "#1c1c1e" if dark else "#f2f2f7"
+        text        = "#ffffff" if dark else "#000000"
+        subtext     = "#8e8e93" if dark else "#6c6c70"
+        section_lbl = "#636366" if dark else "#8e8e93"
+        drop_bg     = "#2c2c2e" if dark else "#ffffff"
+        btn_sec_bg  = "#3a3a3c" if dark else "#e5e5ea"
+        btn_sec_hov = "#48484a" if dark else "#d1d1d6"
+        divider     = "#3a3a3c" if dark else "#e5e5ea"
+
+        self._btn_sec_bg  = btn_sec_bg
+        self._btn_sec_hov = btn_sec_hov
+        self._subtext     = subtext
+
+        self.configure(fg_color=bg)
+
+        wrapper = ctk.CTkFrame(self, fg_color=bg)
+        wrapper.pack(fill="both", expand=True, padx=20, pady=20)
+
+        card = ctk.CTkFrame(wrapper, fg_color=card_bg, corner_radius=14, border_width=1, border_color=border)
         card.pack(fill="both", expand=True)
 
-        inner = ctk.CTkFrame(card, fg_color="transparent")
-        inner.pack(fill="both", expand=True, padx=28, pady=24)
+        body = ctk.CTkFrame(card, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=24, pady=24)
 
         # ── Header ──
-        header_row = ctk.CTkFrame(inner, fg_color="transparent")
-        header_row.pack(fill="x", pady=(0, 4))
+        ctk.CTkLabel(
+            body, text="AudioMirror",
+            font=ctk.CTkFont(family="SF Pro Display", size=17, weight="bold"),
+            text_color=text
+        ).pack(anchor="w")
 
         ctk.CTkLabel(
-            header_row, text="⬡",
-            font=ctk.CTkFont(size=20),
-            text_color="#4f8ef7"
-        ).pack(side="left", padx=(0, 10))
+            body, text="Play audio through two devices simultaneously",
+            font=ctk.CTkFont(family="SF Pro Text", size=12),
+            text_color=subtext
+        ).pack(anchor="w", pady=(2, 16))
 
+        ctk.CTkFrame(body, height=1, fg_color=divider).pack(fill="x", pady=(0, 20))
+
+        # ── Capture From (read-only) ──
         ctk.CTkLabel(
-            header_row, text="AudioMirror",
-            font=ctk.CTkFont(family="Segoe UI", size=20, weight="bold"),
-            text_color="#f9fafb"
-        ).pack(side="left")
+            body, text="CAPTURE FROM",
+            font=ctk.CTkFont(family="SF Pro Text", size=10, weight="bold"),
+            text_color=section_lbl
+        ).pack(anchor="w", pady=(0, 5))
 
+        source_box = ctk.CTkFrame(body, fg_color=input_bg, corner_radius=8, height=36)
+        source_box.pack(fill="x", pady=(0, 16))
+        source_box.pack_propagate(False)
         ctk.CTkLabel(
-            inner,
-            text="Route your audio to a second output device",
-            font=ctk.CTkFont(family="Segoe UI", size=12),
-            text_color="#6b7280"
-        ).pack(anchor="w", pady=(0, 16))
-
-        # Divider
-        ctk.CTkFrame(inner, height=1, fg_color="#2d3448").pack(fill="x", pady=(0, 20))
-
-        # ── Capture From ──
-        ctk.CTkLabel(
-            inner, text="CAPTURE FROM",
-            font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
-            text_color="#4f8ef7"
-        ).pack(anchor="w", pady=(0, 6))
-
-        self.source_combo = ctk.CTkOptionMenu(
-            inner,
-            variable=self.source_var,
-            values=[],
-            height=44,
-            corner_radius=8,
-            fg_color="#0d1117",
-            button_color="#2d3448",
-            button_hover_color="#374151",
-            text_color="#e5e7eb",
-            font=ctk.CTkFont(family="Segoe UI", size=13),
-            dropdown_fg_color="#1e2433",
-            dropdown_hover_color="#2d3448",
-            dropdown_text_color="#e5e7eb",
-        )
-        self.source_combo.pack(fill="x", pady=(0, 20))
+            source_box, textvariable=self.source_var,
+            font=ctk.CTkFont(family="SF Pro Text", size=13),
+            text_color=subtext, anchor="w",
+        ).pack(side="left", padx=12, fill="y")
 
         # ── Mirror To ──
         ctk.CTkLabel(
-            inner, text="MIRROR TO",
-            font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
-            text_color="#4f8ef7"
-        ).pack(anchor="w", pady=(0, 6))
+            body, text="MIRROR TO",
+            font=ctk.CTkFont(family="SF Pro Text", size=10, weight="bold"),
+            text_color=section_lbl
+        ).pack(anchor="w", pady=(0, 5))
 
         self.target_combo = ctk.CTkOptionMenu(
-            inner,
-            variable=self.target_var,
-            values=[],
-            height=44,
-            corner_radius=8,
-            fg_color="#0d1117",
-            button_color="#2d3448",
-            button_hover_color="#374151",
-            text_color="#e5e7eb",
-            font=ctk.CTkFont(family="Segoe UI", size=13),
-            dropdown_fg_color="#1e2433",
-            dropdown_hover_color="#2d3448",
-            dropdown_text_color="#e5e7eb",
+            body, variable=self.target_var, values=[],
+            height=36, corner_radius=8,
+            fg_color=input_bg,
+            button_color=btn_sec_bg,
+            button_hover_color=btn_sec_hov,
+            text_color=text,
+            font=ctk.CTkFont(family="SF Pro Text", size=13),
+            dropdown_fg_color=drop_bg,
+            dropdown_hover_color=btn_sec_bg,
+            dropdown_text_color=text,
         )
         self.target_combo.pack(fill="x", pady=(0, 24))
 
         # ── Buttons ──
-        btn_row = ctk.CTkFrame(inner, fg_color="transparent")
-        btn_row.pack(fill="x", pady=(0, 20))
+        btn_row = ctk.CTkFrame(body, fg_color="transparent")
+        btn_row.pack(fill="x")
+        btn_row.grid_columnconfigure(0, weight=1)
+        btn_row.grid_columnconfigure(1, weight=0)
+        btn_row.grid_columnconfigure(2, weight=0)
 
-        self.start_btn = ctk.CTkButton(
+        self.toggle_btn = ctk.CTkButton(
             btn_row, text="Start Mirroring",
-            command=self.start_mirroring,
-            height=44,
-            corner_radius=8,
-            fg_color="#3b82f6",
-            hover_color="#2563eb",
+            command=self.toggle_mirroring,
+            height=36, corner_radius=8,
+            fg_color="#0a84ff", hover_color="#0070d8",
             text_color="#ffffff",
-            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+            font=ctk.CTkFont(family="SF Pro Text", size=13, weight="bold"),
         )
-        self.start_btn.pack(side="left", expand=True, fill="x", padx=(0, 8))
+        self.toggle_btn.grid(row=0, column=0, sticky="ew", padx=(0, 8))
 
-        self.stop_btn = ctk.CTkButton(
-            btn_row, text="Stop",
-            command=self.stop_mirroring,
-            height=44,
-            corner_radius=8,
-            fg_color="#2d3448",
-            hover_color="#374151",
-            text_color="#9ca3af",
-            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+        self.mute_btn = ctk.CTkButton(
+            btn_row, text="Mute Output",
+            command=self.toggle_mute,
+            height=36, corner_radius=8,
+            fg_color=btn_sec_bg, hover_color=btn_sec_hov,
+            text_color=subtext,
+            font=ctk.CTkFont(family="SF Pro Text", size=13),
             state="disabled",
+            width=110,
         )
-        self.stop_btn.pack(side="left", expand=True, fill="x", padx=(0, 8))
+        self.mute_btn.grid(row=0, column=1, padx=(0, 8))
+        self.mute_btn.grid_remove()
 
-        self.refresh_icon = make_refresh_icon(18, "#9ca3af")
         self.refresh_btn = ctk.CTkButton(
-            btn_row,
-            text="",
-            image=self.refresh_icon,
+            btn_row, text="Refresh",
             command=self.refresh_devices,
-            height=44,
-            width=44,
-            corner_radius=8,
-            fg_color="#2d3448",
-            hover_color="#374151",
+            height=36, corner_radius=8,
+            fg_color=btn_sec_bg, hover_color=btn_sec_hov,
+            text_color=subtext,
+            font=ctk.CTkFont(family="SF Pro Text", size=13),
+            width=75,
         )
-        self.refresh_btn.pack(side="left")
+        self.refresh_btn.grid(row=0, column=2)
 
-        # ── Status bar ──
-        status_card = ctk.CTkFrame(inner, fg_color="#0d1117", corner_radius=8)
-        status_card.pack(fill="x", pady=(0, 0))
-
-        status_inner = ctk.CTkFrame(status_card, fg_color="transparent")
-        status_inner.pack(padx=14, pady=12)
-
-        self.status_dot = ctk.CTkLabel(
-            status_inner, text="●",
-            font=ctk.CTkFont(size=9),
-            text_color="#374151",
-        )
-        self.status_dot.pack(side="left", padx=(0, 8))
-
-        self.status_label = ctk.CTkLabel(
-            status_inner, text="Ready",
-            font=ctk.CTkFont(family="Segoe UI", size=12),
-            text_color="#6b7280"
-        )
-        self.status_label.pack(side="left")
-
-    def _set_status(self, text, color):
-        self.status_label.configure(text=text, text_color=color)
-        self.status_dot.configure(text_color=color)
+    def _get_filtered_target_names(self):
+        source_base = self.source_var.get().replace(" [Loopback]", "").strip()
+        return [
+            d["name"] for d in self.engine.get_output_devices()
+            if source_base not in d["name"]
+        ]
 
     def refresh_devices(self):
         loopbacks = self.engine.get_loopback_devices()
-        outputs = self.engine.get_output_devices()
-
         loopback_names = [d["name"] for d in loopbacks]
-        output_names = [d["name"] for d in outputs]
-
-        self.source_combo.configure(values=loopback_names)
-        self.target_combo.configure(values=output_names)
 
         default_lb = self.engine.get_default_loopback()
         if default_lb and default_lb["name"] in loopback_names:
@@ -377,40 +421,65 @@ class AudioMirrorApp(ctk.CTk):
         elif loopback_names:
             self.source_var.set(loopback_names[0])
 
-        if output_names and not self.target_var.get():
-            self.target_var.set(output_names[0])
+        target_names = self._get_filtered_target_names()
+        self.target_combo.configure(values=target_names)
+        if target_names:
+            self.target_var.set(target_names[0])
 
-        self._set_status("Ready", "#6b7280")
+    def toggle_mirroring(self):
+        if not self._mirroring:
+            self._start()
+        else:
+            self._stop()
 
-    def start_mirroring(self):
+    def _start(self):
         source = self.source_var.get()
         target = self.target_var.get()
 
         if not source or not target:
-            messagebox.showwarning("Missing Selection", "Please select both a source and target device.")
+            messagebox.showwarning("Missing Selection", "No devices found.")
             return
 
         try:
             self.engine.start(source, target)
-            self._set_status("Mirroring active", "#22c55e")
-            self.start_btn.configure(state="disabled", fg_color="#1a3a2e", text_color="#4ade80")
-            self.stop_btn.configure(state="normal", fg_color="#3a1a1a", text_color="#ef4444")
+            self._mirroring = True
+            self.toggle_btn.configure(
+                text="Stop Mirroring",
+                fg_color="#2a2a2e", hover_color="#3a3a3e",
+                text_color="#ff453a",
+            )
+            self.mute_btn.grid()
+            self.mute_btn.configure(state="normal")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to start mirroring:\n{e}")
-            self._set_status("Error", "#ef4444")
 
-    def stop_mirroring(self):
+    def _stop(self):
         try:
             self.engine.stop()
-            self._set_status("Stopped", "#6b7280")
-            self.start_btn.configure(state="normal", fg_color="#3b82f6", text_color="#ffffff")
-            self.stop_btn.configure(state="disabled", fg_color="#2d3448", text_color="#9ca3af")
+            self._mirroring = False
+            self._muted = False
+            self.engine.set_muted(False)
+            self.toggle_btn.configure(
+                text="Start Mirroring",
+                fg_color="#0a84ff", hover_color="#0070d8",
+                text_color="#ffffff",
+            )
+            self.mute_btn.grid_remove()
+            self.mute_btn.configure(
+                state="disabled", text="Mute Output",
+                fg_color=self._btn_sec_bg, text_color=self._subtext,
+            )
         except Exception as e:
             messagebox.showerror("Error", f"Failed to stop mirroring:\n{e}")
-            self._set_status("Error", "#ef4444")
 
+    def toggle_mute(self):
+        self._muted = not self._muted
+        self.engine.set_muted(self._muted)
+        if self._muted:
+            self.mute_btn.configure(text="Unmute Output", fg_color="#3a1a1a", text_color="#ff453a")
+        else:
+            self.mute_btn.configure(text="Mute Output", fg_color=self._btn_sec_bg, text_color=self._subtext)
 
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     app = AudioMirrorApp()
